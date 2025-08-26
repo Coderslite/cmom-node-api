@@ -22,12 +22,20 @@ const openai = new OpenAI({
 // Initialize Express app
 const app = express();
 
-// Enable CORS
+// Enable CORS with specific origins
 app.use(cors({
-  origin: ['https://your-php-app.herokuapp.com', 'http://localhost:3000'], // Replace with your PHP app's Heroku URL
-  methods: ['GET', 'POST'],
-  allowedHeaders: ['Content-Type'],
+  origin: [
+    'http://cmom.leathree.com', // Replace with your PHP app's Heroku URL
+    'http://localhost:3001', // Allow local development
+    'http://localhost:3000'  // Existing local origin (if needed)
+  ],
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Accept'],
+  credentials: true // Allow credentials if needed (e.g., cookies)
 }));
+
+// Handle CORS preflight requests explicitly
+app.options('*', cors());
 
 const upload = multer({ storage: multer.memoryStorage() });
 
@@ -192,7 +200,7 @@ ${JSON.stringify(filteredLines)}
         ],
         response_format: { type: 'json_object' },
         temperature: 0,
-        max_tokens: 4000, // Increased to prevent truncation
+        max_tokens: 4000,
       });
 
       const content = completion.choices[0].message.content;
@@ -236,15 +244,9 @@ app.get('/status/:jobId', (req, res) => {
   }
 
   console.log(`Status check for job ${jobId}: ${job.status}`);
-  if (job.status === 'completed') {
-    res.json({ status: true, data: job.data });
-    // Optionally clean up: jobs.delete(jobId);
-  } else if (job.status === 'error') {
-    res.json({ status: 'error', error: job.error });
-    // Optionally clean up: jobs.delete(jobId);
-  } else {
-    res.json({ status: 'pending' });
-  }
+  res.json(job.status === 'completed' ? { status: true, data: job.data } :
+           job.status === 'error' ? { status: 'error', error: job.error } :
+           { status: 'pending' });
 });
 
 // Start server

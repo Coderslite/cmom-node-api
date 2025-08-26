@@ -106,25 +106,28 @@ app.post('/extract', upload.single('file'), async (req, res) => {
         throw new Error('No text extracted from PDF');
       }
 
-      // 2) Improved filtering: Include potential data lines, group multi-line rows
+      // 2) Improved filtering: Include potential data lines, attempt to group if fragmented
       const stopMarkers = [
         "AP'S OVERDUE", "AP'S DUE", "OVERDUE AP", "DUE CM", "SEPTEMBER", "ALL INTAKE", "NEEDS H0044", "CM"
       ];
       let filteredLines = [];
-      let currentRow = '';
+      let currentRow = [];
       for (const line of allTextLines) {
         const upperLine = line.toUpperCase();
         if (stopMarkers.some(marker => upperLine.includes(marker))) {
+          if (currentRow.length) filteredLines.push(currentRow.join(' ').trim());
           break;
         }
-        if (/^\d+\s/.test(line) || line.includes(',') || /\d{2}\/\d{2}/.test(line) || /[A-Z0-9]{5,}/.test(line)) {
-          if (currentRow) filteredLines.push(currentRow.trim());
-          currentRow = line;
-        } else if (currentRow) {
-          currentRow += ' ' + line; // Append if seems continuation
+        if (/^\d+$/.test(line) || (currentRow.length === 0 && /^\d+\s/.test(line))) { // Start new row on number
+          if (currentRow.length) filteredLines.push(currentRow.join(' ').trim());
+          currentRow = [line];
+        } else if (currentRow.length > 0) {
+          currentRow.push(line); // Append to current row
+        } else if (line.includes(',') || /\d{2}\/\d{2}/.test(line) || /[A-Z0-9]{5,}/.test(line)) {
+          currentRow = [line]; // Start if seems data
         }
       }
-      if (currentRow) filteredLines.push(currentRow.trim());
+      if (currentRow.length) filteredLines.push(currentRow.join(' ').trim());
 
       // Include header if not already
       const headerCandidates = allTextLines.filter(line => line.toUpperCase().includes('NAME') || line.toUpperCase().includes('T1023') || line.toUpperCase().includes('H0044'));
@@ -138,38 +141,53 @@ app.post('/extract', upload.single('file'), async (req, res) => {
 
       console.log(`Job ${jobId} - Filtered lines:`, filteredLines);
 
-      // 3) Improved AI prompts
+      // 3) Improved AI prompts with fragmented examples
       const systemPrompt = `
         You are a precise information extraction engine for billing tables from PDFs.
-        The input is a list of lines, which may include headers, fragmented rows, or multi-line rows.
+        The input is a list of lines, which may include headers, joined rows, or fragmented fields from rows.
         Tables vary by insurer but follow similar patterns: Name, MemberID (MRN/MBR), optional DOB, then T1023 auth/range/bill, then H0044 auth/range/bill, optional paid.
-        Columns may shift if fields are missing (e.g., if no T1023, H0044 appears earlier).
-        Group lines into logical rows and map to the schema. Handle typos like "HOO44" as "H0044".
+        Columns may shift if fields are missing.
+        Group lines or parts into logical rows and map to the schema. Handle typos like "HOO44" as "H0044".
         Return ONLY valid JSON: {"rows": [ ... ]}. No extra text.
       `;
 
       const userInstructions = `
-        Extract rows from these lines. For each row:
+        Extract rows from these lines. The lines may be full row strings (fields joined with spaces) or individual fields (fragmented across lines).
+        For fragmented, group consecutive fields into rows: rows start with optional number, then Name (often "Last, First"), MemberID, optional DOB, then auth IDs and ranges.
 
-        - Identify Name: Usually starts with number then last, first.
-        - MemberID: Alphanumeric ID after name (e.g., "9898293" or "000047747").
-        - DOB: Optional date like "4/5/1971" after ID; skip for schema.
-        - Then, auth IDs (alphanumeric like "146080416" or "0227TPWN2") and ranges (dates like "4/1-6/30").
-        - Assign to T1023 or H0044 based on sequence: First auth/range pair is T1023 if present; second is H0044.
-        - If only one pair and header/context suggests H0044 (e.g., after a skip or in H0044 position), assign to H0044.
-        - BillDate: Rare; usually empty or merged into range.
+        - Identify Name: Contains comma or multiple capitals.
+        - MemberID: Numeric/alphanumeric after name.
+        - DOB: Date like "MM/DD/YYYY"; skip.
+        - Auth IDs: Alphanumeric codes like "146080416" or "0227TPWN2".
+        - Ranges: Date ranges like "4/1-6/30".
+        - Assign first auth/range to T1023, second to H0044.
+        - If only one pair after DOB or in H0044 position, assign to H0044.
+        - BillDate: Usually missing or part of range.
         - Paid: Number like "200" at end.
-        - Use null for missing. Do not invent data.
+        - Use null for missing.
 
-        Examples:
-        Line: "1 Alo, Benjamin 9898293 146080416 4/1-6/30"
-        -> T1023AuthId: "146080416", T1023Range: "4/1-6/30", H0044 null
+        Examples (handle both joined and fragmented similarly by splitting if needed):
 
-        Line: "4 Carobrese, Pamela 14825101 145279520 12/1-2/28 146369822 5/1-7/31"
-        -> T1023AuthId: "145279520", T1023Range: "12/1-2/28", H0044AuthId: "146369822", H0044Range: "5/1-7/31"
+        Joined line: "1 Alo, Benjamin 9898293 146080416 4/1-6/30"
+        -> {"Name": "Alo, Benjamin", "MemberID": "9898293", "T1023AuthId": "146080416", "T1023Range": "4/1-6/30", "H0044AuthId": null, "H0044Range": null, "Paid": null}
 
-        Line: "7 Garner, Michelle 0002668068 11/10/1980 0829TUUVS 08/23-11/23/24"
-        -> No T1023 (skipped after DOB), H0044AuthId: "0829TUUVS", H0044Range: "08/23-11/23/24"
+        Fragmented lines: ["1", "Alo, Benjamin", "9898293", "146080416", "4/1-6/30"]
+        -> Same as above
+
+        Joined line: "4 Carobrese, Pamela 14825101 145279520 12/1-2/28 146369822 5/1-7/31"
+        -> {"Name": "Carobrese, Pamela", "MemberID": "14825101", "T1023AuthId": "145279520", "T1023Range": "12/1-2/28", "H0044AuthId": "146369822", "H0044Range": "5/1-7/31", "Paid": null}
+
+        Fragmented lines: ["4", "Carobrese, Pamela", "14825101", "145279520", "12/1-2/28", "146369822", "5/1-7/31"]
+        -> Same as above
+
+        Joined line with DOB and only H0044: "7 Garner, Michelle 0002668068 11/10/1980 0829TUUVS 08/23-11/23/24"
+        -> {"Name": "Garner, Michelle", "MemberID": "0002668068", "T1023AuthId": null, "T1023Range": null, "H0044AuthId": "0829TUUVS", "H0044Range": "08/23-11/23/24", "Paid": null}
+
+        Fragmented lines: ["7", "Garner, Michelle", "0002668068", "11/10/1980", "0829TUUVS", "08/23-11/23/24"]
+        -> Same as above
+
+        Joined line with paid: "13 Lewis, Elizabeth 44701321 146858872 7/1-7/31 200"
+        -> {"Name": "Lewis, Elizabeth", "MemberID": "44701321", "T1023AuthId": null, "T1023Range": null, "H0044AuthId": "146858872", "H0044Range": "7/1-7/31", "Paid": "200"}
 
         Schema fields: Name, MemberID, T1023AuthId, T1023Range, T1023BillDate, H0044AuthId, H0044Range, H0044BillDate, Paid
 
@@ -178,7 +196,7 @@ app.post('/extract', upload.single('file'), async (req, res) => {
       `;
 
       const completion = await openai.chat.completions.create({
-        model: 'gpt-4o-mini', // Upgrade for better accuracy; fallback to 'gpt-4o-mini' if needed
+        model: 'gpt-4o',
         messages: [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userInstructions },

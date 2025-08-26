@@ -74,8 +74,7 @@ app.post('/extract', upload.single('file'), async (req, res) => {
 
   setImmediate(async () => {
     try {
-      // 1) Extract text per page
-      let allTextLines = [];
+      // 1) Extract structured rows with positions
       const pdfParser = new PDFParser();
       const pdfData = await new Promise((resolve, reject) => {
         pdfParser.on('pdfParser_dataError', errData => reject(errData));
@@ -83,116 +82,121 @@ app.post('/extract', upload.single('file'), async (req, res) => {
         pdfParser.parseBuffer(req.file.buffer);
       });
 
-      allTextLines = pdfData.Pages
-        .flatMap(page => {
-          const textsByRow = {};
-          page.Texts.forEach(text => {
-            const y = text.y;
-            if (!textsByRow[y]) textsByRow[y] = [];
-            try {
-              textsByRow[y].push({ x: text.x, text: decodeURIComponent(text.R[0].T) });
-            } catch (e) {
-              console.error(`Failed to decode text: ${text.R[0].T}`);
-            }
-          });
-          return Object.values(textsByRow)
-            .map(row => row.sort((a, b) => a.x - b.x).map(item => item.text).join(' ').replace(/\s+/g, ' ').trim())
-            .filter(line => line);
+      const pageRows = pdfData.Pages.map(page => {
+        const textsByRow = {};
+        page.Texts.forEach(text => {
+          const y = text.y;
+          if (!textsByRow[y]) textsByRow[y] = [];
+          let decoded;
+          try {
+            decoded = decodeURIComponent(text.R[0].T);
+          } catch (e) {
+            console.error(`Failed to decode text: ${text.R[0].T}`);
+            decoded = text.R[0].T; // fallback
+          }
+          textsByRow[y].push({ x: text.x, text: decoded });
         });
+        // Sort rows by y (top to bottom)
+        const sortedY = Object.keys(textsByRow).sort((a, b) => parseFloat(a) - parseFloat(b));
+        return sortedY.map(y => textsByRow[y].sort((a, b) => a.x - b.x));
+      });
 
-      console.log(`Job ${jobId} - Extracted text lines:`, allTextLines);
+      console.log(`Job ${jobId} - Extracted page rows (length): ${pageRows.map(p => p.length)}`);
 
-      if (!allTextLines.length) {
+      if (!pageRows.flat().length) {
         throw new Error('No text extracted from PDF');
       }
 
-      // 2) Improved filtering: Include potential data lines, attempt to group if fragmented
-      const stopMarkers = [
-        "AP'S OVERDUE", "AP'S DUE", "OVERDUE AP", "DUE CM", "SEPTEMBER", "ALL INTAKE", "NEEDS H0044", "CM"
-      ];
-      let filteredLines = [];
-      let currentRow = [];
-      for (const line of allTextLines) {
-        const upperLine = line.toUpperCase();
-        if (stopMarkers.some(marker => upperLine.includes(marker))) {
-          if (currentRow.length) filteredLines.push(currentRow.join(' ').trim());
-          break;
-        }
-        if (/^\d+$/.test(line) || (currentRow.length === 0 && /^\d+\s/.test(line))) { // Start new row on number
-          if (currentRow.length) filteredLines.push(currentRow.join(' ').trim());
-          currentRow = [line];
-        } else if (currentRow.length > 0) {
-          currentRow.push(line); // Append to current row
-        } else if (line.includes(',') || /\d{2}\/\d{2}/.test(line) || /[A-Z0-9]{5,}/.test(line)) {
-          currentRow = [line]; // Start if seems data
-        }
-      }
-      if (currentRow.length) filteredLines.push(currentRow.join(' ').trim());
+      const inputData = JSON.stringify(pageRows);
 
-      // Include header if not already
-      const headerCandidates = allTextLines.filter(line => line.toUpperCase().includes('NAME') || line.toUpperCase().includes('T1023') || line.toUpperCase().includes('H0044'));
-      if (headerCandidates.length) {
-        filteredLines = [...headerCandidates, ...filteredLines];
-      }
-
-      if (!filteredLines.length) {
-        filteredLines = allTextLines;
-      }
-
-      console.log(`Job ${jobId} - Filtered lines:`, filteredLines);
-
-      // 3) Improved AI prompts with fragmented examples
+      // 2) AI prompts for position-aware table extraction
       const systemPrompt = `
         You are a precise information extraction engine for billing tables from PDFs.
-        The input is a list of lines, which may include headers, joined rows, or fragmented fields from rows.
-        Tables vary by insurer but follow similar patterns: Name, MemberID (MRN/MBR), optional DOB, then T1023 auth/range/bill, then H0044 auth/range/bill, optional paid.
-        Columns may shift if fields are missing.
-        Group lines or parts into logical rows and map to the schema. Handle typos like "HOO44" as "H0044".
+        The input is a JSON array of pages, each page an array of rows, each row an array of {x: number, text: string} sorted by x (left to right).
+        Rows are sorted top to bottom per page.
+        Parse the main billing table (before "AP'S OVERDUE" or similar) into structured rows using positions to align columns.
         Return ONLY valid JSON: {"rows": [ ... ]}. No extra text.
       `;
 
       const userInstructions = `
-        Extract rows from these lines. The lines may be full row strings (fields joined with spaces) or individual fields (fragmented across lines).
-        For fragmented, group consecutive fields into rows: rows start with optional number, then Name (often "Last, First"), MemberID, optional DOB, then auth IDs and ranges.
+        Input is JSON of pageRows. To extract:
 
-        - Identify Name: Contains comma or multiple capitals.
-        - MemberID: Numeric/alphanumeric after name.
-        - DOB: Date like "MM/DD/YYYY"; skip.
-        - Auth IDs: Alphanumeric codes like "146080416" or "0227TPWN2".
-        - Ranges: Date ranges like "4/1-6/30".
-        - Assign first auth/range to T1023, second to H0044.
-        - If only one pair after DOB or in H0044 position, assign to H0044.
-        - BillDate: Usually missing or part of range.
-        - Paid: Number like "200" at end.
-        - Use null for missing.
+        1. Combine all pages' rows into one list (append page rows).
 
-        Examples (handle both joined and fragmented similarly by splitting if needed):
+        2. Find table start: rows with texts like "NAME", "MRN#", "MBR ID #", "T1023", "H0044" (headers may span multiple rows).
 
-        Joined line: "1 Alo, Benjamin 9898293 146080416 4/1-6/30"
-        -> {"Name": "Alo, Benjamin", "MemberID": "9898293", "T1023AuthId": "146080416", "T1023Range": "4/1-6/30", "H0044AuthId": null, "H0044Range": null, "Paid": null}
+        3. Find data rows: following rows starting with small number (e.g., "1", "2") as first text.
 
-        Fragmented lines: ["1", "Alo, Benjamin", "9898293", "146080416", "4/1-6/30"]
-        -> Same as above
+        4. Stop at rows with "AP'S OVERDUE", "AP'S DUE", "OVERDUE", "DUE CM", "ALL INTAKE", "NEEDS H0044", "CM".
 
-        Joined line: "4 Carobrese, Pamela 14825101 145279520 12/1-2/28 146369822 5/1-7/31"
-        -> {"Name": "Carobrese, Pamela", "MemberID": "14825101", "T1023AuthId": "145279520", "T1023Range": "12/1-2/28", "H0044AuthId": "146369822", "H0044Range": "5/1-7/31", "Paid": null}
+        5. Collect tableRows = header rows + data rows.
 
-        Fragmented lines: ["4", "Carobrese, Pamela", "14825101", "145279520", "12/1-2/28", "146369822", "5/1-7/31"]
-        -> Same as above
+        6. Identify columns: Collect all unique x from tableRows, sort them. Group close x (diff < 0.5) into one column, use min x as column key.
 
-        Joined line with DOB and only H0044: "7 Garner, Michelle 0002668068 11/10/1980 0829TUUVS 08/23-11/23/24"
-        -> {"Name": "Garner, Michelle", "MemberID": "0002668068", "T1023AuthId": null, "T1023Range": null, "H0044AuthId": "0829TUUVS", "H0044Range": "08/23-11/23/24", "Paid": null}
+        Let columnPositions = sorted array of those min x.
 
-        Fragmented lines: ["7", "Garner, Michelle", "0002668068", "11/10/1980", "0829TUUVS", "08/23-11/23/24"]
-        -> Same as above
+        7. For each row in tableRows, create columnValues: array of length columnPositions.length, init empty strings.
 
-        Joined line with paid: "13 Lewis, Elizabeth 44701321 146858872 7/1-7/31 200"
-        -> {"Name": "Lewis, Elizabeth", "MemberID": "44701321", "T1023AuthId": null, "T1023Range": null, "H0044AuthId": "146858872", "H0044Range": "7/1-7/31", "Paid": "200"}
+        For each text in row, find closest column i where |text.x - columnPositions[i]| is min, append text to columnValues[i] with space.
 
-        Schema fields: Name, MemberID, T1023AuthId, T1023Range, T1023BillDate, H0044AuthId, H0044Range, H0044BillDate, Paid
+        8. Determine headers: For header rows (before first data row), combine columnValues[i] across them (join with ' ') to get label[i].
 
-        LINES:
-        ${JSON.stringify(filteredLines)}
+        Trim and normalize labels (e.g., "HOO44" -> "H0044").
+
+        9. Map labels to schema fields:
+
+        - "NAME" -> Name
+
+        - "MRN#" or "MBR ID #" or "MRN" -> MemberID
+
+        - "DOB" -> skip
+
+        - First "T1023" label column -> T1023AuthId
+
+        - Next column if includes "AUTH DATES" or "DATE RANGE" or "D/R" or "B/D RANGE" -> T1023Range
+
+        - Next if "BILLED" or "BILL DATE" -> T1023BillDate
+
+        - "H0044" -> H0044AuthId
+
+        - Next "AUTH DATES" or "D/R" -> H0044Range
+
+        - Next "BILLED" -> H0044BillDate
+
+        - "PAID" -> Paid
+
+        Match loosely, use position sequence.
+
+        10. For each data row, get columnValues, then create object with mapped fields = columnValues[corresponding i], trim, null if empty.
+
+        For Name field: If columnValues[Name index] starts with a number (e.g., "16 Villasenor, Casandra"), remove the number and any following space to get only the name (e.g., "Villasenor, Casandra").
+
+        Return {"rows": array of those objects}
+
+        If no rows, {"rows": []}
+
+        Example (simplified x):
+
+        Suppose rows:
+
+        [[{x:5, text:"NAME"}, {x:20, text:"MRN#"}, {x:30, text:"T1023"}, {x:40, text:"D/R"}, {x:50, text:"H0044"}, {x:60, text:"D/R"}]],
+
+        [[{x:5, text:"1"}, {x:6, text:"Alvarado, Desiree"}, {x:21, text:"00006379999"}, {x:31, text:"0221F7P2K"}, {x:41, text:"2/20-5/20"}, {x:51, text:"0519MLRQG"}, {x:61, text:"05/20-8/20"}]],
+
+        [[{x:5, text:"16"}, {x:6, text:"Villasenor, Casandra"}, {x:21, text:"0001115644"}, {x:31, text:"0219WM2M5"}, {x:41, text:"2/17-5/17"}, {x:51, text:"0528WGD6P"}, {x:61, text:"05/17-08/17"}]]
+
+        Column positions ~5,20,30,40,50,60
+
+        Labels: NAME, MRN#, T1023, D/R, H0044, D/R
+
+        Map: Name=0, MemberID=1, T1023AuthId=2, T1023Range=3, H0044AuthId=4, H0044Range=5
+
+        Row1: Name="Alvarado, Desiree", MemberID="00006379999", T1023AuthId="0221F7P2K", T1023Range="2/20-5/20", H0044AuthId="0519MLRQG", H0044Range="05/20-8/20", T1023BillDate=null, H0044BillDate=null, Paid=null
+
+        Row2: Name="Villasenor, Casandra", MemberID="0001115644", T1023AuthId="0219WM2M5", T1023Range="2/17-5/17", H0044AuthId="0528WGD6P", H0044Range="05/17-08/17", T1023BillDate=null, H0044BillDate=null, Paid=null
+
+        PAGE_ROWS:
+        ${inputData}
       `;
 
       const completion = await openai.chat.completions.create({
@@ -226,7 +230,7 @@ app.post('/extract', upload.single('file'), async (req, res) => {
       const normalized = rows.map(row => {
         const parsed = UnifiedRowSchema.safeParse(row);
         return parsed.success ? parsed.data : {};
-      }).filter(row => Object.values(row).some(val => val)); // Remove empty rows
+      }).filter(row => Object.values(row).some(val => val != null)); // Remove empty rows
 
       jobs.set(jobId, { status: 'completed', data: normalized });
       console.log(`Job ${jobId} - Completed with ${normalized.length} rows`);

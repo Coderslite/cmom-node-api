@@ -4,6 +4,7 @@ import PDFParser from 'pdf2json';
 import { z } from 'zod';
 import OpenAI from 'openai';
 import dotenv from 'dotenv';
+import { v4 as uuidv4 } from 'uuid';
 
 // Load environment variables
 dotenv.config();
@@ -20,6 +21,9 @@ const openai = new OpenAI({
 // Initialize Express app
 const app = express();
 const upload = multer({ storage: multer.memoryStorage() });
+
+// In-memory job storage (for simplicity; use Redis or DB for production)
+const jobs = new Map(); // jobId -> { status: 'pending' | 'completed' | 'error', data: [], error: string }
 
 // Unified row schema using zod
 const UnifiedRowSchema = z.object({
@@ -48,97 +52,98 @@ app.post('/extract', upload.single('file'), async (req, res) => {
     return res.status(400).json({ status: false, data: [], error: 'Please upload a PDF' });
   }
 
-  // 1) Extract text per page
-  let allTextLines = [];
-  try {
-    const pdfParser = new PDFParser();
-    const pdfData = await new Promise((resolve, reject) => {
-      pdfParser.on('pdfParser_dataError', errData => reject(errData));
-      pdfParser.on('pdfParser_dataReady', pdfData => resolve(pdfData));
-      pdfParser.parseBuffer(req.file.buffer);
-    });
+  const jobId = uuidv4();
+  jobs.set(jobId, { status: 'pending' });
 
-    // Extract text from pdf2json output
-    allTextLines = pdfData.Pages
-      .flatMap(page => {
-        // Group texts by Y-coordinate to approximate table rows
-        const textsByRow = {};
-        page.Texts.forEach(text => {
-          const y = text.y;
-          if (!textsByRow[y]) textsByRow[y] = [];
-          try {
-            textsByRow[y].push({ x: text.x, text: decodeURIComponent(text.R[0].T) });
-          } catch (e) {
-            console.error(`Failed to decode text: ${text.R[0].T}`);
-          }
-        });
-        // Sort texts by X-coordinate and join into a line
-        return Object.values(textsByRow)
-          .map(row => row.sort((a, b) => a.x - b.x).map(item => item.text).join(' ').replace(/\s+/g, ' ').trim())
-          .filter(line => line);
+  // Process in background to avoid timeout
+  setImmediate(async () => {
+    try {
+      // 1) Extract text per page
+      let allTextLines = [];
+      const pdfParser = new PDFParser();
+      const pdfData = await new Promise((resolve, reject) => {
+        pdfParser.on('pdfParser_dataError', errData => reject(errData));
+        pdfParser.on('pdfParser_dataReady', pdfData => resolve(pdfData));
+        pdfParser.parseBuffer(req.file.buffer);
       });
 
-    console.log('Extracted text lines:', allTextLines); // Debug log
-  } catch (e) {
-    console.error('PDF parsing error:', e);
-    return res.status(500).json({ status: false, data: [], error: `PDF read error: ${e.message}` });
-  }
+      // Extract text from pdf2json output
+      allTextLines = pdfData.Pages
+        .flatMap(page => {
+          // Group texts by Y-coordinate to approximate table rows
+          const textsByRow = {};
+          page.Texts.forEach(text => {
+            const y = text.y;
+            if (!textsByRow[y]) textsByRow[y] = [];
+            try {
+              textsByRow[y].push({ x: text.x, text: decodeURIComponent(text.R[0].T) });
+            } catch (e) {
+              console.error(`Failed to decode text: ${text.R[0].T}`);
+            }
+          });
+          // Sort texts by X-coordinate and join into a line
+          return Object.values(textsByRow)
+            .map(row => row.sort((a, b) => a.x - b.x).map(item => item.text).join(' ').replace(/\s+/g, ' ').trim())
+            .filter(line => line);
+        });
 
-  if (!allTextLines.length) {
-    console.log('No text lines extracted from PDF');
-    return res.status(200).json({ status: false, data: [], error: 'No text extracted from PDF' });
-  }
+      console.log('Extracted text lines:', allTextLines); // Debug log
 
-  // 2) Heuristic: filter rows (relaxed)
-  const stopMarkers = [
-    "AP'S OVERDUE",
-    "AP'S DUE",
-    "OVERDUE AP",
-    "DUE CM",
-    "SEPTEMBER",
-    "ALL INTAKE",
-    "NEEDS H0044",
-  ];
-  let filteredLines = [];
-  for (const line of allTextLines) {
-    if (stopMarkers.some(marker => line.toUpperCase().includes(marker))) {
-      console.log('Stopped filtering at marker:', line);
-      break;
-    }
-    // Include potential header or data lines
-    if (
-      line.toUpperCase().includes('NAME') ||
-      line.toUpperCase().includes('MRN') ||
-      line.toUpperCase().includes('MBR') ||
-      line.toUpperCase().includes('T1023') ||
-      line.toUpperCase().includes('H0044') ||
-      /^\d+\s/.test(line) ||
-      line.includes(',') ||
-      /\d{2}\/\d{2}/.test(line) ||
-      /[A-Z0-9]{5,}/.test(line) // Potential auth IDs
-    ) {
-      filteredLines.push(line);
-    }
-  }
+      if (!allTextLines.length) {
+        jobs.set(jobId, { status: 'error', error: 'No text extracted from PDF' });
+        return;
+      }
 
-  if (!filteredLines.length) {
-    console.log('No lines passed filtering, using all text lines');
-    filteredLines = allTextLines;
-  }
+      // 2) Heuristic: filter rows (relaxed)
+      const stopMarkers = [
+        "AP'S OVERDUE",
+        "AP'S DUE",
+        "OVERDUE AP",
+        "DUE CM",
+        "SEPTEMBER",
+        "ALL INTAKE",
+        "NEEDS H0044",
+      ];
+      let filteredLines = [];
+      for (const line of allTextLines) {
+        if (stopMarkers.some(marker => line.toUpperCase().includes(marker))) {
+          console.log('Stopped filtering at marker:', line);
+          break;
+        }
+        // Include potential header or data lines
+        if (
+          line.toUpperCase().includes('NAME') ||
+          line.toUpperCase().includes('MRN') ||
+          line.toUpperCase().includes('MBR') ||
+          line.toUpperCase().includes('T1023') ||
+          line.toUpperCase().includes('H0044') ||
+          /^\d+\s/.test(line) ||
+          line.includes(',') ||
+          /\d{2}\/\d{2}/.test(line) ||
+          /[A-Z0-9]{5,}/.test(line) // Potential auth IDs
+        ) {
+          filteredLines.push(line);
+        }
+      }
 
-  console.log('Filtered lines:', filteredLines); // Debug log
+      if (!filteredLines.length) {
+        console.log('No lines passed filtering, using all text lines');
+        filteredLines = allTextLines;
+      }
 
-  // 3) Build AI prompt
-  const systemPrompt = `
-    You are a precise information extraction engine for billing tables.
-    You will receive text lines from a PDF, which may include headers and rows.
-    The lines may be fragmented, incomplete, or lack clear structure.
-    Group lines into logical table rows based on context and map them to the schema below.
-    Return ONLY valid JSON of the form: {"rows": [ ... ]} with NO extra text.
-    Ensure the output is valid JSON, even if no rows are extracted.
-  `;
+      console.log('Filtered lines:', filteredLines); // Debug log
 
-  const userInstructions = `
+      // 3) Build AI prompt
+      const systemPrompt = `
+        You are a precise information extraction engine for billing tables.
+        You will receive text lines from a PDF, which may include headers and rows.
+        The lines may be fragmented, incomplete, or lack clear structure.
+        Group lines into logical table rows based on context and map them to the schema below.
+        Return ONLY valid JSON of the form: {"rows": [ ... ]} with NO extra text.
+        Ensure the output is valid JSON, even if no rows are extracted.
+      `;
+
+      const userInstructions = `
 We have billing tables from different insurers with varying headers.
 The input lines may be fragmented (e.g., names, IDs, or dates on separate lines).
 Group lines into logical rows and unify each row into this MERGED SCHEMA (use strings; use null if missing):
@@ -167,57 +172,62 @@ LINES:
 ${JSON.stringify(filteredLines)}
 `;
 
-  try {
-    const completion = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userInstructions },
-      ],
-      response_format: { type: 'json_object' },
-      temperature: 0,
-      max_tokens: 4000, // Increased to prevent truncation
-    });
-
-    const content = completion.choices[0].message.content;
-    console.log('OpenAI response:', content); // Debug log
-
-    let data;
-    try {
-      data = JSON.parse(content);
-    } catch (jsonError) {
-      console.error('JSON parse error:', jsonError.message);
-      console.error('Raw OpenAI response:', content);
-      return res.status(500).json({
-        status: false,
-        data: [],
-        error: `AI extraction failed: Invalid JSON response`,
-        rawResponse: content,
+      const completion = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userInstructions },
+        ],
+        response_format: { type: 'json_object' },
+        temperature: 0,
+        max_tokens: 4000, // Increased to prevent truncation
       });
-    }
 
-    const rows = data.rows || [];
+      const content = completion.choices[0].message.content;
+      console.log('OpenAI response:', content); // Debug log
 
-    // Validate and normalize rows
-    const normalized = rows.map(row => {
-      const parsed = UnifiedRowSchema.safeParse(row);
-      return parsed.success ? parsed.data : {};
-    });
+      let data;
+      try {
+        data = JSON.parse(content);
+      } catch (jsonError) {
+        console.error('JSON parse error:', jsonError.message);
+        console.error('Raw OpenAI response:', content);
+        jobs.set(jobId, { status: 'error', error: `Invalid JSON response: ${jsonError.message}` });
+        return;
+      }
 
-    // If no rows, include filtered lines for debugging
-    if (!normalized.length) {
-      return res.json({
-        status: true,
-        data: [],
-        filteredLines,
-        error: 'No rows extracted',
+      const rows = data.rows || [];
+
+      // Validate and normalize rows
+      const normalized = rows.map(row => {
+        const parsed = UnifiedRowSchema.safeParse(row);
+        return parsed.success ? parsed.data : {};
       });
-    }
 
-    res.json({ status: true, data: normalized });
-  } catch (e) {
-    console.error('AI extraction error:', e);
-    res.status(500).json({ status: false, data: [], error: `AI extraction failed: ${e.message}` });
+      jobs.set(jobId, { status: 'completed', data: normalized });
+    } catch (e) {
+      console.error('Processing error:', e);
+      jobs.set(jobId, { status: 'error', error: e.message });
+    }
+  });
+
+  res.json({ status: true, jobId, message: 'Processing started. Poll /status/' + jobId });
+});
+
+app.get('/status/:jobId', (req, res) => {
+  const job = jobs.get(req.params.jobId);
+  if (!job) {
+    return res.status(404).json({ error: 'Job not found' });
+  }
+
+  if (job.status === 'completed') {
+    res.json({ status: true, data: job.data });
+    // Optionally clean up: jobs.delete(req.params.jobId);
+  } else if (job.status === 'error') {
+    res.json({ status: false, error: job.error });
+    // Optionally clean up: jobs.delete(req.params.jobId);
+  } else {
+    res.json({ status: 'pending' });
   }
 });
 

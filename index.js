@@ -25,24 +25,23 @@ const app = express();
 // Enable CORS with specific origins
 app.use(cors({
   origin: [
-    'http://cmom.leathree.com', // Replace with your PHP app's Heroku URL
-    'http://localhost:3001', // Allow local development
-    'http://localhost:3000'  // Existing local origin (if needed)
+    'http://cmom.leathree.com',
+    'http://localhost:3001',
+    'http://localhost:3000'
   ],
   methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Accept'],
-  credentials: true // Allow credentials if needed (e.g., cookies)
+  credentials: true
 }));
 
-// Handle CORS preflight requests explicitly
 app.options('*', cors());
 
 const upload = multer({ storage: multer.memoryStorage() });
 
-// In-memory job storage (for simplicity; use Redis or DB for production)
-const jobs = new Map(); // jobId -> { status: 'pending' | 'completed' | 'error', data: [], error: string }
+// In-memory job storage
+const jobs = new Map();
 
-// Unified row schema using zod
+// Unified row schema
 const UnifiedRowSchema = z.object({
   Name: z.string().nullable().optional(),
   MemberID: z.string().nullable().optional(),
@@ -55,7 +54,6 @@ const UnifiedRowSchema = z.object({
   Paid: z.string().nullable().optional(),
 });
 
-// Express routes
 app.get('/debug', async (req, res) => {
   res.json({ openai_version: OpenAI.version || 'unknown' });
 });
@@ -74,7 +72,6 @@ app.post('/extract', upload.single('file'), async (req, res) => {
   jobs.set(jobId, { status: 'pending' });
   console.log(`Started job ${jobId} for PDF processing`);
 
-  // Process in background to avoid timeout
   setImmediate(async () => {
     try {
       // 1) Extract text per page
@@ -86,10 +83,8 @@ app.post('/extract', upload.single('file'), async (req, res) => {
         pdfParser.parseBuffer(req.file.buffer);
       });
 
-      // Extract text from pdf2json output
       allTextLines = pdfData.Pages
         .flatMap(page => {
-          // Group texts by Y-coordinate to approximate table rows
           const textsByRow = {};
           page.Texts.forEach(text => {
             const y = text.y;
@@ -100,7 +95,6 @@ app.post('/extract', upload.single('file'), async (req, res) => {
               console.error(`Failed to decode text: ${text.R[0].T}`);
             }
           });
-          // Sort texts by X-coordinate and join into a line
           return Object.values(textsByRow)
             .map(row => row.sort((a, b) => a.x - b.x).map(item => item.text).join(' ').replace(/\s+/g, ' ').trim())
             .filter(line => line);
@@ -109,91 +103,82 @@ app.post('/extract', upload.single('file'), async (req, res) => {
       console.log(`Job ${jobId} - Extracted text lines:`, allTextLines);
 
       if (!allTextLines.length) {
-        jobs.set(jobId, { status: 'error', error: 'No text extracted from PDF' });
-        console.error(`Job ${jobId} - No text extracted`);
-        return;
+        throw new Error('No text extracted from PDF');
       }
 
-      // 2) Heuristic: filter rows (relaxed)
+      // 2) Improved filtering: Include potential data lines, group multi-line rows
       const stopMarkers = [
-        "AP'S OVERDUE",
-        "AP'S DUE",
-        "OVERDUE AP",
-        "DUE CM",
-        "SEPTEMBER",
-        "ALL INTAKE",
-        "NEEDS H0044",
+        "AP'S OVERDUE", "AP'S DUE", "OVERDUE AP", "DUE CM", "SEPTEMBER", "ALL INTAKE", "NEEDS H0044", "CM"
       ];
       let filteredLines = [];
+      let currentRow = '';
       for (const line of allTextLines) {
-        if (stopMarkers.some(marker => line.toUpperCase().includes(marker))) {
-          console.log(`Job ${jobId} - Stopped filtering at marker:`, line);
+        const upperLine = line.toUpperCase();
+        if (stopMarkers.some(marker => upperLine.includes(marker))) {
           break;
         }
-        // Include potential header or data lines
-        if (
-          line.toUpperCase().includes('NAME') ||
-          line.toUpperCase().includes('MRN') ||
-          line.toUpperCase().includes('MBR') ||
-          line.toUpperCase().includes('T1023') ||
-          line.toUpperCase().includes('H0044') ||
-          /^\d+\s/.test(line) ||
-          line.includes(',') ||
-          /\d{2}\/\d{2}/.test(line) ||
-          /[A-Z0-9]{5,}/.test(line) // Potential auth IDs
-        ) {
-          filteredLines.push(line);
+        if (/^\d+\s/.test(line) || line.includes(',') || /\d{2}\/\d{2}/.test(line) || /[A-Z0-9]{5,}/.test(line)) {
+          if (currentRow) filteredLines.push(currentRow.trim());
+          currentRow = line;
+        } else if (currentRow) {
+          currentRow += ' ' + line; // Append if seems continuation
         }
+      }
+      if (currentRow) filteredLines.push(currentRow.trim());
+
+      // Include header if not already
+      const headerCandidates = allTextLines.filter(line => line.toUpperCase().includes('NAME') || line.toUpperCase().includes('T1023') || line.toUpperCase().includes('H0044'));
+      if (headerCandidates.length) {
+        filteredLines = [...headerCandidates, ...filteredLines];
       }
 
       if (!filteredLines.length) {
-        console.log(`Job ${jobId} - No lines passed filtering, using all text lines`);
         filteredLines = allTextLines;
       }
 
       console.log(`Job ${jobId} - Filtered lines:`, filteredLines);
 
-      // 3) Build AI prompt
+      // 3) Improved AI prompts
       const systemPrompt = `
-        You are a precise information extraction engine for billing tables.
-        You will receive text lines from a PDF, which may include headers and rows.
-        The lines may be fragmented, incomplete, or lack clear structure.
-        Group lines into logical table rows based on context and map them to the schema below.
-        Return ONLY valid JSON of the form: {"rows": [ ... ]} with NO extra text.
-        Ensure the output is valid JSON, even if no rows are extracted.
+        You are a precise information extraction engine for billing tables from PDFs.
+        The input is a list of lines, which may include headers, fragmented rows, or multi-line rows.
+        Tables vary by insurer but follow similar patterns: Name, MemberID (MRN/MBR), optional DOB, then T1023 auth/range/bill, then H0044 auth/range/bill, optional paid.
+        Columns may shift if fields are missing (e.g., if no T1023, H0044 appears earlier).
+        Group lines into logical rows and map to the schema. Handle typos like "HOO44" as "H0044".
+        Return ONLY valid JSON: {"rows": [ ... ]}. No extra text.
       `;
 
       const userInstructions = `
-We have billing tables from different insurers with varying headers.
-The input lines may be fragmented (e.g., names, IDs, or dates on separate lines).
-Group lines into logical rows and unify each row into this MERGED SCHEMA (use strings; use null if missing):
+        Extract rows from these lines. For each row:
 
-- Name
-- MemberID (from MRN#, MRN, or MBR ID #)
-- T1023AuthId
-- T1023Range
-- T1023BillDate
-- H0044AuthId
-- H0044Range
-- H0044BillDate
-- Paid
+        - Identify Name: Usually starts with number then last, first.
+        - MemberID: Alphanumeric ID after name (e.g., "9898293" or "000047747").
+        - DOB: Optional date like "4/5/1971" after ID; skip for schema.
+        - Then, auth IDs (alphanumeric like "146080416" or "0227TPWN2") and ranges (dates like "4/1-6/30").
+        - Assign to T1023 or H0044 based on sequence: First auth/range pair is T1023 if present; second is H0044.
+        - If only one pair and header/context suggests H0044 (e.g., after a skip or in H0044 position), assign to H0044.
+        - BillDate: Rare; usually empty or merged into range.
+        - Paid: Number like "200" at end.
+        - Use null for missing. Do not invent data.
 
-IMPORTANT RULES:
-1) Group lines into rows based on context (e.g., a name followed by an ID or date).
-2) Pair RANGE/BILL columns correctly for T1023 and H0044.
-3) 'MemberID' comes from MRN#, MRN, or MBR ID # (alphanumeric IDs).
-4) Do not invent data. Use null for missing fields.
-5) Keep date/range formats as found (e.g., '04/01-07/01' or '04/01/23').
-6) Use context clues (e.g., date patterns 'MM/DD' or 'MM/DD/YYYY', alphanumeric IDs) to align data.
-7) If no valid rows can be formed, return {"rows": []}.
-8) Ensure the output is valid JSON with properly escaped strings.
+        Examples:
+        Line: "1 Alo, Benjamin 9898293 146080416 4/1-6/30"
+        -> T1023AuthId: "146080416", T1023Range: "4/1-6/30", H0044 null
 
-LINES:
-${JSON.stringify(filteredLines)}
-`;
+        Line: "4 Carobrese, Pamela 14825101 145279520 12/1-2/28 146369822 5/1-7/31"
+        -> T1023AuthId: "145279520", T1023Range: "12/1-2/28", H0044AuthId: "146369822", H0044Range: "5/1-7/31"
+
+        Line: "7 Garner, Michelle 0002668068 11/10/1980 0829TUUVS 08/23-11/23/24"
+        -> No T1023 (skipped after DOB), H0044AuthId: "0829TUUVS", H0044Range: "08/23-11/23/24"
+
+        Schema fields: Name, MemberID, T1023AuthId, T1023Range, T1023BillDate, H0044AuthId, H0044Range, H0044BillDate, Paid
+
+        LINES:
+        ${JSON.stringify(filteredLines)}
+      `;
 
       const completion = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
+        model: 'gpt-4o', // Upgrade for better accuracy; fallback to 'gpt-4o-mini' if needed
         messages: [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userInstructions },
@@ -209,26 +194,30 @@ ${JSON.stringify(filteredLines)}
       let data;
       try {
         data = JSON.parse(content);
+        if (!data.rows || !Array.isArray(data.rows)) {
+          throw new Error('Invalid structure: missing "rows" array');
+        }
       } catch (jsonError) {
-        console.error(`Job ${jobId} - JSON parse error:`, jsonError.message);
-        console.error(`Job ${jobId} - Raw OpenAI response:`, content);
-        jobs.set(jobId, { status: 'error', error: `Invalid JSON response: ${jsonError.message}` });
-        return;
+        console.error(`Job ${jobId} - JSON parse error:`, jsonError.message, content);
+        throw jsonError;
       }
 
-      const rows = data.rows || [];
+      const rows = data.rows;
 
-      // Validate and normalize rows
+      // Validate and normalize
       const normalized = rows.map(row => {
         const parsed = UnifiedRowSchema.safeParse(row);
         return parsed.success ? parsed.data : {};
-      });
+      }).filter(row => Object.values(row).some(val => val)); // Remove empty rows
 
       jobs.set(jobId, { status: 'completed', data: normalized });
       console.log(`Job ${jobId} - Completed with ${normalized.length} rows`);
     } catch (e) {
       console.error(`Job ${jobId} - Processing error:`, e);
       jobs.set(jobId, { status: 'error', error: e.message });
+    } finally {
+      // Cleanup job after 30min
+      setTimeout(() => jobs.delete(jobId), 30 * 60 * 1000);
     }
   });
 
@@ -239,14 +228,11 @@ app.get('/status/:jobId', (req, res) => {
   const jobId = req.params.jobId;
   const job = jobs.get(jobId);
   if (!job) {
-    console.error(`Status check failed for job ${jobId}: Job not found`);
     return res.status(404).json({ error: `Job ${jobId} not found` });
   }
-
-  console.log(`Status check for job ${jobId}: ${job.status}`);
   res.json(job.status === 'completed' ? { status: true, data: job.data } :
-           job.status === 'error' ? { status: 'error', error: job.error } :
-           { status: 'pending' });
+    job.status === 'error' ? { status: 'error', error: job.error } :
+      { status: 'pending' });
 });
 
 // Start server

@@ -178,7 +178,7 @@ app.post('/extract', upload.single('file'), async (req, res) => {
       `;
 
       const completion = await openai.chat.completions.create({
-        model: 'gpt-4o', // Upgrade for better accuracy; fallback to 'gpt-4o-mini' if needed
+        model: 'gpt-4o-mini', // Upgrade for better accuracy; fallback to 'gpt-4o-mini' if needed
         messages: [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userInstructions },

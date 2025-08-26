@@ -24,7 +24,7 @@ const app = express();
 
 // Enable CORS
 app.use(cors({
-  origin: ['https://your-php-app.herokuapp.com', 'http://localhost:3000'], // Replace with your PHP app's Heroku URL or local URL
+  origin: ['https://your-php-app.herokuapp.com', 'http://localhost:3000'], // Replace with your PHP app's Heroku URL
   methods: ['GET', 'POST'],
   allowedHeaders: ['Content-Type'],
 }));
@@ -58,11 +58,13 @@ app.get('/', async (req, res) => {
 
 app.post('/extract', upload.single('file'), async (req, res) => {
   if (!req.file || !req.file.mimetype.endsWith('pdf')) {
+    console.error('Invalid file upload:', { mimetype: req.file?.mimetype });
     return res.status(400).json({ status: false, data: [], error: 'Please upload a PDF' });
   }
 
   const jobId = uuidv4();
   jobs.set(jobId, { status: 'pending' });
+  console.log(`Started job ${jobId} for PDF processing`);
 
   // Process in background to avoid timeout
   setImmediate(async () => {
@@ -96,10 +98,11 @@ app.post('/extract', upload.single('file'), async (req, res) => {
             .filter(line => line);
         });
 
-      console.log('Extracted text lines:', allTextLines); // Debug log
+      console.log(`Job ${jobId} - Extracted text lines:`, allTextLines);
 
       if (!allTextLines.length) {
         jobs.set(jobId, { status: 'error', error: 'No text extracted from PDF' });
+        console.error(`Job ${jobId} - No text extracted`);
         return;
       }
 
@@ -116,7 +119,7 @@ app.post('/extract', upload.single('file'), async (req, res) => {
       let filteredLines = [];
       for (const line of allTextLines) {
         if (stopMarkers.some(marker => line.toUpperCase().includes(marker))) {
-          console.log('Stopped filtering at marker:', line);
+          console.log(`Job ${jobId} - Stopped filtering at marker:`, line);
           break;
         }
         // Include potential header or data lines
@@ -136,11 +139,11 @@ app.post('/extract', upload.single('file'), async (req, res) => {
       }
 
       if (!filteredLines.length) {
-        console.log('No lines passed filtering, using all text lines');
+        console.log(`Job ${jobId} - No lines passed filtering, using all text lines`);
         filteredLines = allTextLines;
       }
 
-      console.log('Filtered lines:', filteredLines); // Debug log
+      console.log(`Job ${jobId} - Filtered lines:`, filteredLines);
 
       // 3) Build AI prompt
       const systemPrompt = `
@@ -193,14 +196,14 @@ ${JSON.stringify(filteredLines)}
       });
 
       const content = completion.choices[0].message.content;
-      console.log('OpenAI response:', content); // Debug log
+      console.log(`Job ${jobId} - OpenAI response:`, content);
 
       let data;
       try {
         data = JSON.parse(content);
       } catch (jsonError) {
-        console.error('JSON parse error:', jsonError.message);
-        console.error('Raw OpenAI response:', content);
+        console.error(`Job ${jobId} - JSON parse error:`, jsonError.message);
+        console.error(`Job ${jobId} - Raw OpenAI response:`, content);
         jobs.set(jobId, { status: 'error', error: `Invalid JSON response: ${jsonError.message}` });
         return;
       }
@@ -214,8 +217,9 @@ ${JSON.stringify(filteredLines)}
       });
 
       jobs.set(jobId, { status: 'completed', data: normalized });
+      console.log(`Job ${jobId} - Completed with ${normalized.length} rows`);
     } catch (e) {
-      console.error('Processing error:', e);
+      console.error(`Job ${jobId} - Processing error:`, e);
       jobs.set(jobId, { status: 'error', error: e.message });
     }
   });
@@ -224,17 +228,20 @@ ${JSON.stringify(filteredLines)}
 });
 
 app.get('/status/:jobId', (req, res) => {
-  const job = jobs.get(req.params.jobId);
+  const jobId = req.params.jobId;
+  const job = jobs.get(jobId);
   if (!job) {
-    return res.status(404).json({ error: 'Job not found' });
+    console.error(`Status check failed for job ${jobId}: Job not found`);
+    return res.status(404).json({ error: `Job ${jobId} not found` });
   }
 
+  console.log(`Status check for job ${jobId}: ${job.status}`);
   if (job.status === 'completed') {
     res.json({ status: true, data: job.data });
-    // Optionally clean up: jobs.delete(req.params.jobId);
+    // Optionally clean up: jobs.delete(jobId);
   } else if (job.status === 'error') {
     res.json({ status: 'error', error: job.error });
-    // Optionally clean up: jobs.delete(req.params.jobId);
+    // Optionally clean up: jobs.delete(jobId);
   } else {
     res.json({ status: 'pending' });
   }

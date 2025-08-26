@@ -5,6 +5,7 @@ import { z } from 'zod';
 import OpenAI from 'openai';
 import dotenv from 'dotenv';
 import { v4 as uuidv4 } from 'uuid';
+import cors from 'cors';
 
 // Load environment variables
 dotenv.config();
@@ -20,6 +21,14 @@ const openai = new OpenAI({
 
 // Initialize Express app
 const app = express();
+
+// Enable CORS
+app.use(cors({
+  origin: ['https://your-php-app.herokuapp.com', 'http://localhost:3000'], // Replace with your PHP app's Heroku URL or local URL
+  methods: ['GET', 'POST'],
+  allowedHeaders: ['Content-Type'],
+}));
+
 const upload = multer({ storage: multer.memoryStorage() });
 
 // In-memory job storage (for simplicity; use Redis or DB for production)
@@ -224,7 +233,7 @@ app.get('/status/:jobId', (req, res) => {
     res.json({ status: true, data: job.data });
     // Optionally clean up: jobs.delete(req.params.jobId);
   } else if (job.status === 'error') {
-    res.json({ status: false, error: job.error });
+    res.json({ status: 'error', error: job.error });
     // Optionally clean up: jobs.delete(req.params.jobId);
   } else {
     res.json({ status: 'pending' });

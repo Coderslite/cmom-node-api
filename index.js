@@ -26,7 +26,7 @@ const app = express();
 app.use(cors({
   origin: [
     'http://cmom.leathree.com',
-    'https://cmom.leathree.com/',
+    'https://cmom.leathree.com',
     'http://localhost:3001',
     'http://localhost:3000'
   ],
